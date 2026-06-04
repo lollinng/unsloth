@@ -955,6 +955,59 @@ class LlamaCppBackend:
     # ── Binary discovery ──────────────────────────────────────────
 
     @staticmethod
+    def _nvidia_available() -> bool:
+        """Return True when a local NVIDIA GPU is visible.
+
+        Used only to break ties between CPU and CUDA llama.cpp builds on
+        Windows. Keep this lightweight: binary discovery runs before the
+        heavy inference stack is initialized.
+        """
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "-L"],
+                capture_output = True,
+                text = True,
+                timeout = 5,
+                check = False,
+                **_windows_hidden_subprocess_kwargs(),
+            )
+            return result.returncode == 0 and "GPU" in (result.stdout or "")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _windows_llama_server_candidates(
+        root: Path,
+        binary_name: str,
+        *,
+        prefer_cuda: bool,
+    ) -> list[Path]:
+        default_candidates = [
+            root / binary_name,
+            root / "build" / "bin" / binary_name,
+            root / "build" / "bin" / "Release" / binary_name,
+        ]
+        if not prefer_cuda:
+            return default_candidates
+        return [
+            root / "build-cuda" / "bin" / "Release" / binary_name,
+            root / "build-cuda" / "bin" / binary_name,
+            *default_candidates,
+        ]
+
+    @staticmethod
+    def _first_existing_llama_server(candidates: Iterable[Path]) -> Optional[str]:
+        for candidate in candidates:
+            if candidate.is_file():
+                if "build-cuda" in candidate.parts:
+                    logger.info(
+                        "Preferring CUDA llama-server build over CPU build: %s",
+                        candidate,
+                    )
+                return str(candidate)
+        return None
+
+    @staticmethod
     def _find_llama_server_binary() -> Optional[str]:
         """
         Locate the llama-server binary.
@@ -964,7 +1017,10 @@ class LlamaCppBackend:
         1b. UNSLOTH_LLAMA_CPP_PATH env var (custom llama.cpp install dir)
         2.  ~/.unsloth/llama.cpp/llama-server        (make build, root dir)
         3.  ~/.unsloth/llama.cpp/build/bin/llama-server  (cmake build, Linux)
-        4.  ~/.unsloth/llama.cpp/build/bin/Release/llama-server.exe  (cmake build, Windows)
+        4a. ~/.unsloth/llama.cpp/build-cuda/bin/Release/llama-server.exe
+            (cmake CUDA build, Windows, preferred when NVIDIA is present)
+        4b. ~/.unsloth/llama.cpp/build/bin/Release/llama-server.exe
+            (cmake build / prebuilt layout, Windows)
         5.  ./llama.cpp/llama-server                 (legacy: make build, root dir)
         6.  ./llama.cpp/build/bin/llama-server        (legacy: cmake in-tree build)
         7.  llama-server on PATH                     (system install)
@@ -977,23 +1033,33 @@ class LlamaCppBackend:
         if env_path and Path(env_path).is_file():
             return env_path
 
+        prefer_windows_cuda = (
+            sys.platform == "win32" and LlamaCppBackend._nvidia_available()
+        )
+
         # 1b. UNSLOTH_LLAMA_CPP_PATH — custom llama.cpp install directory
         custom_llama_cpp = os.environ.get("UNSLOTH_LLAMA_CPP_PATH")
         if custom_llama_cpp:
             custom_dir = Path(custom_llama_cpp)
-            # Root dir (make builds)
-            root_bin = custom_dir / binary_name
-            if root_bin.is_file():
-                return str(root_bin)
-            # build/bin/ (cmake builds on Linux)
-            cmake_bin = custom_dir / "build" / "bin" / binary_name
-            if cmake_bin.is_file():
-                return str(cmake_bin)
-            # build/bin/Release/ (cmake builds on Windows)
             if sys.platform == "win32":
-                win_bin = custom_dir / "build" / "bin" / "Release" / binary_name
-                if win_bin.is_file():
-                    return str(win_bin)
+                found = LlamaCppBackend._first_existing_llama_server(
+                    LlamaCppBackend._windows_llama_server_candidates(
+                        custom_dir,
+                        binary_name,
+                        prefer_cuda = prefer_windows_cuda,
+                    )
+                )
+                if found:
+                    return found
+            else:
+                # Root dir (make builds)
+                root_bin = custom_dir / binary_name
+                if root_bin.is_file():
+                    return str(root_bin)
+                # build/bin/ (cmake builds on Linux)
+                cmake_bin = custom_dir / "build" / "bin" / binary_name
+                if cmake_bin.is_file():
+                    return str(cmake_bin)
 
         # 2-4. Match installer layout: env-mode -> $STUDIO_HOME/llama.cpp;
         # default/HOME-redirect -> ~/.unsloth/llama.cpp (sibling of studio).
@@ -1025,33 +1091,46 @@ class LlamaCppBackend:
                 _seen_roots.add(k)
                 _unique_roots.append(r)
         for unsloth_home in _unique_roots:
-            home_root = unsloth_home / binary_name
-            if home_root.is_file():
-                return str(home_root)
-            home_linux = unsloth_home / "build" / "bin" / binary_name
-            if home_linux.is_file():
-                return str(home_linux)
             if sys.platform == "win32":
-                home_win = unsloth_home / "build" / "bin" / "Release" / binary_name
-                if home_win.is_file():
-                    return str(home_win)
+                found = LlamaCppBackend._first_existing_llama_server(
+                    LlamaCppBackend._windows_llama_server_candidates(
+                        unsloth_home,
+                        binary_name,
+                        prefer_cuda = prefer_windows_cuda,
+                    )
+                )
+                if found:
+                    return found
+            else:
+                home_root = unsloth_home / binary_name
+                if home_root.is_file():
+                    return str(home_root)
+                home_linux = unsloth_home / "build" / "bin" / binary_name
+                if home_linux.is_file():
+                    return str(home_linux)
 
         # 5–6. Legacy: in-tree build (older setup.sh / setup.ps1 versions)
         project_root = Path(__file__).resolve().parents[4]
-        # Root dir (make builds)
-        root_path = project_root / "llama.cpp" / binary_name
-        if root_path.is_file():
-            return str(root_path)
-        # build/bin/ (cmake builds)
-        build_path = project_root / "llama.cpp" / "build" / "bin" / binary_name
-        if build_path.is_file():
-            return str(build_path)
+        legacy_root = project_root / "llama.cpp"
         if sys.platform == "win32":
-            win_path = (
-                project_root / "llama.cpp" / "build" / "bin" / "Release" / binary_name
+            found = LlamaCppBackend._first_existing_llama_server(
+                LlamaCppBackend._windows_llama_server_candidates(
+                    legacy_root,
+                    binary_name,
+                    prefer_cuda = prefer_windows_cuda,
+                )
             )
-            if win_path.is_file():
-                return str(win_path)
+            if found:
+                return found
+        else:
+            # Root dir (make builds)
+            root_path = legacy_root / binary_name
+            if root_path.is_file():
+                return str(root_path)
+            # build/bin/ (cmake builds)
+            build_path = legacy_root / "build" / "bin" / binary_name
+            if build_path.is_file():
+                return str(build_path)
 
         # 7. System PATH
         system_path = shutil.which("llama-server")
@@ -1591,6 +1670,87 @@ class LlamaCppBackend:
             ranked_gpus = ranked,
         )
         return None, True
+
+    @staticmethod
+    def _extra_arg_value(
+        args: list[str],
+        index: int,
+        flag: str,
+    ) -> tuple[Optional[str], int]:
+        token = args[index]
+        if token == flag:
+            if index + 1 >= len(args):
+                return None, 1
+            return args[index + 1], 2
+        if token.startswith(f"{flag}="):
+            return token.split("=", 1)[1], 1
+        if flag == "-ngl" and token.startswith("-ngl") and len(token) > len("-ngl"):
+            return token[len("-ngl") :], 1
+        return None, 0
+
+    @staticmethod
+    def _extra_args_set_threads(extra_args: Optional[Iterable[object]]) -> bool:
+        args = [str(arg) for arg in (extra_args or [])]
+        for index, token in enumerate(args):
+            for flag in ("-t", "--threads"):
+                _value, consumed = LlamaCppBackend._extra_arg_value(args, index, flag)
+                if consumed:
+                    return True
+            if token.startswith("-t") and len(token) > len("-t"):
+                return True
+        return False
+
+    @staticmethod
+    def _effective_full_gpu_offload(
+        *,
+        use_fit: bool,
+        gpu_indices: Optional[list[int]],
+        extra_args: Optional[Iterable[object]],
+    ) -> bool:
+        """Return whether the final llama-server args imply full GPU offload.
+
+        Studio appends pass-through args last, so user `-ngl` / `--fit`
+        overrides must be considered before applying Windows-only full-offload
+        launch tuning.
+        """
+        fit_enabled = bool(use_fit)
+        gpu_layers_all = gpu_indices is not None and not fit_enabled
+        args = [str(arg) for arg in (extra_args or [])]
+        index = 0
+        while index < len(args):
+            token = args[index]
+            consumed = 1
+
+            for flag in ("-ngl", "--gpu-layers", "--n-gpu-layers"):
+                value, flag_consumed = LlamaCppBackend._extra_arg_value(
+                    args, index, flag
+                )
+                if flag_consumed:
+                    consumed = flag_consumed
+                    try:
+                        gpu_layers_all = int(str(value).strip()) == -1
+                    except Exception:
+                        gpu_layers_all = False
+                    break
+            else:
+                for flag in ("-fit", "--fit"):
+                    value, flag_consumed = LlamaCppBackend._extra_arg_value(
+                        args, index, flag
+                    )
+                    if flag_consumed:
+                        consumed = flag_consumed
+                        raw = "" if value is None else str(value).strip().lower()
+                        if raw in {"off", "false", "0", "no"}:
+                            fit_enabled = False
+                        elif raw in {"on", "true", "1", "yes"}:
+                            fit_enabled = True
+                        else:
+                            fit_enabled = True
+                        break
+
+            index += max(1, consumed)
+
+        return gpu_layers_all and not fit_enabled
 
     # ── KV cache VRAM estimation ─────────────────────────────────────
 
@@ -3135,6 +3295,12 @@ class LlamaCppBackend:
                     "--no-context-shift",
                 ]
 
+                fully_gpu_offloaded = self._effective_full_gpu_offload(
+                    use_fit = use_fit,
+                    gpu_indices = gpu_indices,
+                    extra_args = extra_args,
+                )
+
                 if use_fit:
                     cmd.extend(["--fit", "on"])
                 elif gpu_indices is not None:
@@ -3144,9 +3310,16 @@ class LlamaCppBackend:
                 # -1 = llama.cpp auto-detect (physical cores). Pass explicitly so we
                 # do not inherit llama-server's internal default, which has historically
                 # varied (hardware concurrency incl. hyperthreads on some builds).
-                cmd.extend(
-                    ["--threads", str(n_threads if n_threads is not None else -1)]
-                )
+                # On Windows full-offload runs, use two llama.cpp threads by default
+                # to avoid OpenMP spin-wait burning every logical CPU (#5692/#5999).
+                threads_arg = n_threads if n_threads is not None else -1
+                if (
+                    sys.platform == "win32"
+                    and fully_gpu_offloaded
+                    and n_threads is None
+                ):
+                    threads_arg = 2
+                cmd.extend(["--threads", str(threads_arg)])
 
                 # Always enable Jinja chat template rendering for proper template support
                 cmd.extend(["--jinja"])
@@ -3280,6 +3453,23 @@ class LlamaCppBackend:
                 else:
                     self._api_key = None
 
+                # Windows full offload: llama-server prompt-cache checkpoints can
+                # copy KV state through WDDM/PCI-E and saturate CPU during token
+                # generation. Keep this before user extra_args so explicit
+                # pass-through overrides still win.
+                if sys.platform == "win32" and fully_gpu_offloaded:
+                    cmd.extend(
+                        [
+                            "--cache-ram",
+                            "0",
+                            "--ctx-checkpoints",
+                            "0",
+                            "--no-cache-prompt",
+                            "--checkpoint-every-n-tokens",
+                            "-1",
+                        ]
+                    )
+
                 # User-supplied pass-through args go last so llama.cpp's
                 # last-wins flag parsing lets the user override Studio's
                 # auto-set tier-2 flags (e.g. --cache-type-k, --spec-type).
@@ -3299,9 +3489,6 @@ class LlamaCppBackend:
                 logger.info(f"Starting llama-server: {' '.join(_log_cmd)}")
 
                 # Set library paths so llama-server can find its shared libs and CUDA DLLs
-                import os
-                import sys
-
                 env = child_env_without_native_path_secret()
                 binary_dir = str(Path(binary).parent)
 
@@ -3322,6 +3509,14 @@ class LlamaCppBackend:
                     )
                     existing_path = env.get("PATH", "")
                     env["PATH"] = ";".join(path_dirs) + ";" + existing_path
+
+                    if fully_gpu_offloaded:
+                        env.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+                        if (
+                            n_threads is None
+                            and not self._extra_args_set_threads(extra_args)
+                        ):
+                            env.setdefault("OMP_NUM_THREADS", "2")
 
                     # ROCm: the llama.cpp prebuilt bundles its own rocblas.dll
                     # but NOT the Tensile kernel library files it needs
